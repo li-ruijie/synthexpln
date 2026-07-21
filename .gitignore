@@ -1,0 +1,16 @@
+*.Rproj
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+build/
+/doc/
+/Meta/
+*.tar.gz
+*.Rcheck/
+
+# A private note to the CRAN reviewers, not for publication. Every tracked file
+# in this tree is force-pushed to the public GitHub mirror by
+# sync-gh-synthexpln.cmd, and .Rbuildignore only governs the tarball, so keeping
+# this file out of the mirror means keeping it untracked.
+cran-comments.md

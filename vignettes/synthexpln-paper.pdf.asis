@@ -1,0 +1,6 @@
+%\VignetteIndexEntry{Conditional moment conditions to reproduce statistical inference from synthetic data}
+%\VignetteEngine{R.rsp::asis}
+%\VignetteKeyword{PDF}
+%\VignetteKeyword{synthetic data}
+%\VignetteKeyword{inferential fidelity}
+%\VignetteKeyword{differential privacy}

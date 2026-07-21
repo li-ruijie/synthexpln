@@ -1,0 +1,7 @@
+bibentry(
+  bibtype = "Unpublished",
+  title   = "Preserving Generalized Linear Model Inference in Synthetic Data",
+  author  = person("Ruijie", "Li"),
+  year    = "2026",
+  note    = "Manuscript. An earlier version is included as a vignette in the synthexpln R package"
+)
