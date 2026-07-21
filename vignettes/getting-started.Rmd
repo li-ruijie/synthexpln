@@ -1,0 +1,152 @@
+---
+title: "Getting started with synthexpln"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Getting started with synthexpln}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r include = FALSE}
+knitr::opts_chunk$set(collapse = TRUE, comment = "#>")
+```
+
+```{r setup}
+library(synthexpln)
+set.seed(1)
+```
+
+## 1. The problem
+
+Analysts often release regression results computed on sensitive data that cannot be shared directly.
+That raises the constructive question of whether synthetic data can preserve the inferential
+properties of the original analysis, so that others may verify and build upon the reported findings.
+
+**Projection-based synthetic data** offers a principled solution. The key insight, formalised in
+the sufficient-statistics projection theorem of Li (2026), is that if we condition synthetic data
+on the regression coefficients estimated from the original data, we can recover those coefficients
+when fitting the same model to the synthetic data, to IEEE 754 double-precision machine epsilon
+(about 2.2e-16) under a Gaussian identity link and to Newton tolerance for other GLM families. The synthetic data is then
+**inferentially faithful**, preserving the analyst's point estimates. Distributional
+realism is a separate property that exact coefficient recovery does not imply, and the paper's
+central result is that optimising for it does not deliver inferential fidelity.
+
+When combined with differential privacy, the analyst can add noise to the coefficients and
+release a differentially private version, while still allowing synthetic data to be generated
+that matches the published (noisy) coefficients to the same precision.
+
+## 2. Non-DP projection
+
+Consider a simple regression example. Suppose the original analyst has 500 observations
+with a response and three covariates:
+
+```{r}
+n <- 500
+d <- data.frame(
+  y  = NA,
+  x1 = rnorm(n),
+  x2 = rbinom(n, 1, 0.4),
+  x3 = runif(n)
+)
+d$y <- 1 + 0.5 * d$x1 - 0.3 * d$x2 + 0.2 * d$x3 + rnorm(n, 0.5)
+```
+
+First, the analyst fits a regression model and records the coefficients:
+
+```{r}
+fit.orig <- lm(y ~ x1 + x2 + x3, d)
+coef(fit.orig)
+```
+
+Now we use `projection()` to generate synthetic data conditioned on those coefficients.
+The function automatically extracts the model formula and fits coefficients, then projects
+synthetic data onto the constraint surface:
+
+```{r}
+syn <- projection(d, y ~ x1 + x2 + x3)
+coef(lm(y ~ x1 + x2 + x3, syn$syn))
+```
+
+Notice that the refitted coefficients match the originals to within a few units in the last place
+of IEEE 754 double precision. Measured across 4,800 Gaussian runs spanning sample sizes from 100 to
+5000, 2 to 8 predictors, and independent through strongly correlated designs, the deviation relative
+to the size of the coefficient vector had a median of 3.9e-16 and a worst case of 3.1e-15, which is
+13.9 ulp. That is the Gaussian identity-link case; other families are looser by orders of magnitude,
+and `?projection` tabulates them.
+This is the core guarantee: the synthetic data preserves the published coefficients.
+
+## 3. Differentially private release
+
+In practice, the analyst may want to add privacy protection before release.
+`dp.project()` wraps `projection()` and adds differentially private noise to the
+coefficients.
+
+It will not, however, guess a privacy assumption on your behalf. Every sound DP
+route rests on something fixed **before the data are seen**, and a wrapper cannot
+invent one, so a bare call is refused:
+
+```{r error = TRUE}
+dp.project(d, y ~ x1 + x2 + x3, epsilon = 10)
+```
+
+Supply the assumption you can actually defend. Here the covariates are public and
+`y` is bounded by construction, so `B.y` is a fact about the simulation rather
+than a quantity read off `d$y`:
+
+```{r}
+syn.dp <- dp.project(d, y ~ x1 + x2 + x3,
+                     epsilon = 10, delta = 1e-6,
+                     x.public = TRUE, B.y = 20, seed = 1)
+syn.dp$variant
+coef(lm(y ~ x1 + x2 + x3, syn.dp$syn))
+syn.dp$beta.dp
+```
+
+The returned object contains:
+
+- `syn$syn`: the synthetic data frame, which is the DP release
+- `beta.dp`: the differentially private coefficients
+- `sigma.beta.raw`: the per-coefficient noise sd, for inference calibration
+- `mu.total`, `mu.check`: the mu-GDP accounting
+
+When others refit the model on this synthetic data, they recover `beta.dp`
+exactly, the noisy coefficients the analyst intended to publish. Note that
+`beta.hat` is also returned but is the **non-private** full-data fit, carried for
+evaluation only: it must not be composed downstream.
+
+See `vignette("dp-guide")` for choosing among the three sound routes.
+
+## 4. Calibrated standard errors
+
+The standard errors computed from the synthetic data understate the true
+uncertainty, because they know nothing about the privacy noise that produced the
+coefficients in the first place. Correct them with `calibrated.se()`, passing the
+per-coefficient noise sd the object reports:
+
+```{r}
+fit.syn <- lm(y ~ x1 + x2 + x3, syn.dp$syn)
+se.syn  <- summary(fit.syn)$coefficients[, "Std. Error"]
+se.corr <- calibrated.se(se.syn, syn.dp$sigma.beta.raw)
+data.frame(term = names(se.syn), se.syn, se.corr)
+```
+
+`$sigma.beta.raw` is the noise sd on the **raw** scale of each coefficient. Pass
+that and nothing else: there is no column scale to divide by, and dividing by one
+would shrink the correction and understate the uncertainty of a private release.
+See `vignette("calibrated-inference")`.
+
+The corrected standard errors are larger, reflecting the uncertainty the privacy
+mechanism actually introduced. These are what to report.
+
+## 5. Auditing the DP guarantee
+
+To check that the empirical privacy guarantee matches the theoretical one,
+use `dp.audit()`. This function is computationally expensive and is gated behind the
+`SYNTHEXPLN_FULL_TESTS` environment variable. See `vignette("dp-guide")` for details.
+
+## 6. Next steps
+
+- Read `vignette("dp-guide")` for a deeper dive into privacy tuning and auditing.
+- Read `vignette("calibrated-inference")` for guidance on valid statistical inference
+  with calibrated standard errors.
+- See Li (2026) for the theoretical foundations.

@@ -1,0 +1,183 @@
+# Release workflow for synthexpln.
+#
+# Fires on a version bump: whenever DESCRIPTION's Version has no matching
+# vX.Y.Z tag, this builds the CRAN tarball, checks it with --as-cran, then tags
+# and publishes a release with the tarball attached.
+#
+# The trigger is deliberately "no tag for this version" rather than a diff
+# against the previous commit. The production mirror is force-pushed and keeps
+# exactly ONE commit, so HEAD~1 does not exist and a diff-based trigger cannot
+# work. Tags survive the force-push, which makes them the durable record of what
+# has already shipped, and re-running on an unchanged version is a no-op.
+#
+# Pinned to SHAs per project security policy.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+name: release
+
+permissions: {}
+
+jobs:
+  check-release:
+    runs-on: ubuntu-latest
+    name: Decide whether to release
+    permissions:
+      contents: read
+    outputs:
+      release: ${{ steps.decide.outputs.release }}
+      version: ${{ steps.decide.outputs.version }}
+      tag: ${{ steps.decide.outputs.tag }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+
+      - name: Read DESCRIPTION and compare against existing tags
+        id: decide
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/^Version:[[:space:]]*//p' DESCRIPTION | head -n 1 | tr -d '[:space:]')
+          if [ -z "$version" ]; then
+            echo "::error::no Version field found in DESCRIPTION"
+            exit 1
+          fi
+          tag="v${version}"
+
+          # Same gate the project applies to any release tag.
+          if ! printf '%s' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+[a-z]?$'; then
+            echo "::error::version '${version}' does not match ^[0-9]+\.[0-9]+\.[0-9]+[a-z]?$"
+            exit 1
+          fi
+
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+
+          if git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null 2>&1; then
+            echo "release=false" >> "$GITHUB_OUTPUT"
+            echo "Tag ${tag} already exists. Nothing to release." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "release=true" >> "$GITHUB_OUTPUT"
+            echo "Version ${version} has no ${tag} tag. Releasing." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  release:
+    needs: check-release
+    if: needs.check-release.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    name: Build, check and publish ${{ needs.check-release.outputs.tag }}
+    permissions:
+      contents: write
+    env:
+      GITHUB_PAT: ${{ secrets.GITHUB_TOKEN }}
+      R_KEEP_PKG_SOURCE: yes
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - uses: r-lib/actions/setup-r@6f6e5bc62fba3a704f74e7ad7ef7676c5c6a2590
+        with:
+          use-public-rspm: true
+
+      - uses: r-lib/actions/setup-pandoc@6f6e5bc62fba3a704f74e7ad7ef7676c5c6a2590
+
+      - name: Install TinyTeX for the PDF manual
+        uses: r-lib/actions/setup-tinytex@6f6e5bc62fba3a704f74e7ad7ef7676c5c6a2590
+
+      # Without these the HTML-manual check skips both HTML validation and math
+      # rendering and reports a NOTE for having done so. That NOTE is a property
+      # of the runner and not of the package, CRAN's own machines carrying both,
+      # so installing them here keeps the check result about the package.
+      - name: Install HTML Tidy and the V8 headers
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends tidy libv8-dev
+
+      - uses: r-lib/actions/setup-r-dependencies@6f6e5bc62fba3a704f74e7ad7ef7676c5c6a2590
+        with:
+          extra-packages: any::rcmdcheck, any::V8
+          needs: check
+
+      # R CMD build, not a git archive: this honours .Rbuildignore, knits the
+      # three vignettes, and produces the exact .tar.gz that goes to CRAN.
+      - name: Build the source tarball
+        id: build
+        run: |
+          set -euo pipefail
+          R CMD build .
+          tarball=$(ls -1 synthexpln_*.tar.gz)
+          echo "tarball=${tarball}" >> "$GITHUB_OUTPUT"
+          expected="synthexpln_${{ needs.check-release.outputs.version }}.tar.gz"
+          if [ "$tarball" != "$expected" ]; then
+            echo "::error::built ${tarball} but DESCRIPTION says ${expected}"
+            exit 1
+          fi
+
+      # The tarball is only publishable if it passes the checks CRAN runs, so a
+      # failure here must stop the release rather than be reported and ignored.
+      #
+      # Errors and warnings fail the release. NOTEs do not, since a first
+      # submission always draws the "New submission" NOTE from the incoming
+      # feasibility check and there is no way to satisfy it before publication.
+      # The log is uploaded either way, so any NOTE is still on the record.
+      - name: Check the tarball as CRAN
+        run: |
+          set -euo pipefail
+          R CMD check --as-cran --run-donttest \
+            "${{ steps.build.outputs.tarball }}" || true
+
+          log=synthexpln.Rcheck/00check.log
+          if [ ! -f "$log" ]; then
+            echo "::error::check produced no 00check.log"
+            exit 1
+          fi
+          tail -n 5 "$log"
+
+          if grep -qE '^Status:.*(ERROR|WARNING)' "$log"; then
+            echo "::error::R CMD check --as-cran reported an ERROR or WARNING"
+            grep -nE '\.\.\. (ERROR|WARNING)' "$log" || true
+            exit 1
+          fi
+          grep -E '^Status:' "$log" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the check log when the check fails
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: check-results-${{ needs.check-release.outputs.tag }}
+          path: synthexpln.Rcheck/
+
+      - name: Tag and publish the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.check-release.outputs.tag }}
+          VERSION: ${{ needs.check-release.outputs.version }}
+          TARBALL: ${{ steps.build.outputs.tarball }}
+        run: |
+          set -euo pipefail
+
+          # Extract this version's NEWS.md section for the release body, falling
+          # back to a plain line if the heading is not found.
+          notes=$(awk -v v="$VERSION" '
+            $0 ~ "^# synthexpln " v "$" { inside = 1; next }
+            inside && /^# synthexpln / { exit }
+            inside { print }
+          ' NEWS.md)
+          if [ -z "$(printf '%s' "$notes" | tr -d '[:space:]')" ]; then
+            notes="Release ${VERSION}."
+          fi
+
+          {
+            printf '%s\n\n' "$notes"
+            printf 'The attached `%s` is the source tarball built by `R CMD build`, ' "$TARBALL"
+            printf 'checked with `R CMD check --as-cran --run-donttest`.\n\n'
+            printf 'Install it with:\n\n'
+            printf '```r\ninstall.packages("%s", repos = NULL, type = "source")\n```\n' "$TARBALL"
+          } > release-notes.md
+
+          gh release create "$TAG" "$TARBALL" \
+            --title "synthexpln $VERSION" \
+            --notes-file release-notes.md \
+            --target "$GITHUB_SHA"

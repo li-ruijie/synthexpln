@@ -1,0 +1,32 @@
+# Line endings are LF everywhere, in the index and in the working tree, on
+# every platform.  This file is authoritative and overrides any user-level
+# core.autocrlf or core.eol setting, so a clone on Windows checks out LF too.
+* text=auto eol=lf
+
+# Binary formats.  Declared so that no normalisation is ever attempted on
+# them, since a stray CRLF rewrite inside a PDF or a serialised R object
+# corrupts the file silently.
+*.pdf    binary
+*.rds    binary
+*.RData  binary
+*.rda    binary
+*.rdb    binary
+*.rdx    binary
+*.dta    binary
+*.png    binary
+*.jpg    binary
+*.jpeg   binary
+*.gif    binary
+*.ico    binary
+*.zip    binary
+*.gz     binary
+*.tar    binary
+*.xlsx   binary
+*.xls    binary
+*.docx   binary
+*.pptx   binary
+*.ttf    binary
+*.otf    binary
+*.woff   binary
+*.woff2  binary
+*.olean  binary

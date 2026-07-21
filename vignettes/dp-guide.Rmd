@@ -1,0 +1,333 @@
+---
+title: "Choosing a DP route from the assumptions you can defend"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Choosing a DP route from the assumptions you can defend}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r include = FALSE}
+knitr::opts_chunk$set(collapse = TRUE, comment = "#>")
+```
+
+```{r setup}
+library(synthexpln)
+set.seed(1)
+```
+
+## 1. The only question that matters
+
+Differential privacy calibrates noise to a **global sensitivity**: the largest
+the released quantity can move across *any* pair of neighbouring datasets. That
+is a statement about a universe of possible datasets, so it can only come from
+something you fixed **before you saw the data**.
+
+Every DP route in this package therefore begins by asking you to name that
+something. There are exactly three answers, and choosing among them is the whole
+of the design work.
+
+| You can assume | Route | Needs |
+|---|---|---|
+| The design is public **and** the response has a public bound | **Route 1**, exact and least noisy | `x.public = TRUE`, `B.y` |
+| Neither, or only a public box on the coefficients | **Route 2**, subsample-and-aggregate | `clip.lo`, `clip.hi`, a `dispersion` |
+| The design is **sensitive** but the response admits a public clip | **Route 3**, whitened sufficient statistics | `route = "suffstat"`, `W`, `B.x`, `y.centre`, `y.scale`, `y.clip` |
+
+Route 1 is exact and least noisy wherever a genuine `B.y` exists. Route 2 is the
+only route on an unbounded response, since it needs no bound on `|y|` at all.
+Route 3 keeps the design private. Its standing against Route 2 depends on the
+budget and on the width of the public coefficient box, and it is ahead of the
+central box at the smallest budget and at every budget on a structurally
+bounded response. Section 5 below covers the remaining case, a sensitive
+design released under DP alongside the coefficient.
+
+Routes 1 and 2 are selected by the shape of the problem, from what you supply.
+Route 3 is **asked for by name**, `route = "suffstat"`, and is not inferred
+from its constants. Its lead over Route 2 reverses with the budget, ahead at
+small epsilon and behind from about `epsilon = 5` where the public bound is a
+clip on an unbounded-support response, so a
+wrapper that chose it for you would be picking a privacy-utility trade-off that
+is yours to make.
+
+If you can supply none of them, you do not have a mechanism, and `dp.project()`
+will tell you so rather than inventing one.
+
+```{r error = TRUE}
+d <- data.frame(y = rnorm(500), x = rnorm(500))
+dp.project(d, y ~ x, epsilon = 10)
+```
+
+That refusal is the most important line in the package. A bound read off the
+sample (`B.y <- 1.5 * max(abs(y))`, say) makes the noise scale a function of the
+very data it protects. Neighbouring datasets then get different noise, no
+sensitivity bound holds across the pair, and there is **no theorem to
+instantiate**. The release is not weakly private. It is not private at any
+epsilon, and a smaller epsilon does not help.
+
+## 2. Route 1: a public design and a bounded response
+
+Where the covariates are public and the response has a genuine bound from the
+domain, ordinary least squares has a clean global sensitivity. Replacing one
+row's response moves `X'y` by `x_i (y_i' - y_i)` and nothing else, so
+
+$$\Delta_\beta = 2 B_y \max_i \|(X'X)^{-1} x_i\|_2,$$
+
+a function of the public design and the public bound alone. This route is exact
+and it is the least noisy available, so prefer it whenever `B.y` is real.
+
+`B.y` must come from the domain: a physiological range, a reporting cap, a
+structurally bounded instrument. Below, `y` is standard normal *by construction*,
+so six standard deviations bound it. That is a fact about the simulation on the
+line above, not a quantity read off `d$y`.
+
+```{r}
+syn <- gen.syn.dp.ols.public(d, y ~ x, epsilon = 10, delta = 1e-6,
+                             B.y = 6, seed = 1)
+
+# the analyst's refit recovers the DP coefficient EXACTLY
+all.equal(unname(coef(lm(y ~ x, syn$syn))), unname(syn$beta.dp))
+
+# and the DP dispersion too
+all.equal(summary(lm(y ~ x, syn$syn))$sigma^2, syn$sigma2.dp)
+```
+
+`gen.syn.dp.ridge.public()` is the same route with `A = X'X + lambda I` in place
+of `X'X`, for ill-conditioned designs. Its sensitivity reduces to the OLS one as
+`lambda` goes to zero.
+
+### When Route 1 does not exist at all
+
+If the response is genuinely unbounded, **no finite `B.y` exists**. Any Gaussian
+outcome is unbounded. Route 1 is then not merely noisier, it is undefined, and
+the accurate statement is to say so and use Route 2. Where you do want Route 1 on an
+unbounded response, you must clip `y` to a public range as an explicit
+preprocessing step, which moves the estimand to clipped-OLS and must be reported
+as such.
+
+## 3. Route 2: subsample-and-aggregate
+
+Route 2 needs **no bound on the response at all**. Rows are partitioned into `m`
+blocks by position under a fixed public seed, the model is fit per block, and
+each coordinate is aggregated by a Widened Winsorized Mean over a **public box**.
+
+One row changes exactly one block. That block's coefficient is clipped into the
+box, so it moves by at most `hi_j - lo_j`, and the mean over `m` blocks moves by
+at most `s_j = (hi_j - lo_j) / m`. No design constant and no statistic of the
+data appears anywhere in that argument, so it holds under **full-row**
+replacement: whether the neighbour changed `x`, `y`, or both, and however large
+the response is.
+
+That is the reason the mechanism exists (Nissim, Raskhodnikova and Smith
+2007 designed it for statistics with no bounded global sensitivity).
+
+The cost is that you must supply the box. That cost is unavoidable and deliberate,
+since the old API needed no bounds at all, which is how the defect remained unnoticed.
+
+```{r}
+n  <- 1000
+dg <- data.frame(x1 = rnorm(n), x2 = rnorm(n))
+dg$y <- 1 + 0.5 * dg$x1 - 0.3 * dg$x2 + rnorm(n, 0, 2)
+
+syn2 <- gen.syn.dp.projected.subagg(
+  dg, y ~ x1 + x2, epsilon = 10, family = gaussian(),
+  clip.lo = -3, clip.hi = 3,            # PUBLIC box on the coefficients
+  dispersion = dp.dispersion.public(
+    4, source = "the instrument's quoted variance, published in the manual"),
+  seed = 1)
+
+all.equal(unname(coef(lm(y ~ x1 + x2, syn2$syn))), unname(syn2$beta.dp))
+```
+
+Route 2 publishes the covariates **as they stand**, so it does assume the design
+is public. That is a statement about the *output*, not about the calibration, and
+the two must not be conflated. Where the covariates are themselves sensitive, see
+section 5.
+
+## 4. The dispersion is a parameter, and DP must cover it
+
+A GLM has two parameters, not one. Until version 0.2.0 only the coefficient passed
+through a DP channel here and the dispersion rode into the release on the real
+response, so the dispersion must now be **declared**, and the two defensible answers
+carry different privacy claims.
+
+```{r error = TRUE}
+gen.syn.dp.projected.subagg(dg, y ~ x1 + x2, epsilon = 10,
+                            family = gaussian(), clip.lo = -3, clip.hi = 3)
+```
+
+**Public** (no budget). The value is external knowledge, or the owner has *already
+published* it: journal articles routinely report an $R^2$ or a residual SD
+alongside a coefficient table. Post-processing permits any function of the DP
+output and public information, so re-using it spends no budget and discloses
+nothing new. Where the owner published it themselves, the claim is mu-GDP
+*conditional* on that publication, and a paper must say so.
+
+**Private** (costs). Nothing has been published, so it is paid for: `sigma^2`
+rides along as a `(p+1)`-th aggregated coordinate over its own public box. The L2
+sensitivity rises from `sqrt(p)` to `sqrt(p+1)`, so the coefficient noise rises
+by about 8% at `p = 6`.
+
+```{r}
+pub <- dp.dispersion.public(4, source = "instrument variance, from the manual")
+prv <- dp.dispersion.private(0, 25, source = "the instrument cannot resolve
+                                              below an SD of 5, so sigma^2 <= 25")
+pub
+prv
+```
+
+`source` is **required** and is printed. That is the load-bearing part of the
+design, not decoration. The unsound value still exists as a construction, but to
+use it you now have to write
+
+```r
+dp.dispersion.public(var(residuals(fit)), source = "the sample")
+```
+
+which is self-indicting on the page, and which any reader of the code will catch.
+A design that makes the defect unwriteable without saying so prevents the whole
+class, where a single fix closes only the instance found.
+
+## 5. Sensitive covariates
+
+When the covariates must themselves be protected, `gen.syn.dp.full()` (Gaussian)
+and `gen.syn.dp.logistic()` (binary) release them under DP and compose that with
+the coefficient release. Every channel is a Gaussian mechanism, so the whole
+release composes in **one** mu-GDP quadrature:
+
+$$\mu^2 = \mu_\text{marg}^2 + \mu_\text{corr}^2 + \mu_\text{coef}^2.$$
+
+```{r}
+d4 <- data.frame(y = rnorm(600),
+                 age = rnorm(600, 50, 10),
+                 income = rnorm(600, 100, 20))
+x.spec <- list(age    = list(type = "continuous", bounds = c(0, 100)),
+               income = list(type = "continuous", bounds = c(40, 160)))
+
+syn4 <- gen.syn.dp.full(d4, y ~ age + income, x.spec = x.spec,
+                        epsilon = 10, delta = 1e-6,
+                        clip.lo = -1, clip.hi = 1,    # PUBLIC coefficient box
+                        disp.lo = 0,  disp.hi = 4,    # PUBLIC sigma^2 box
+                        seed = 1)
+
+syn4$mu.channels             # the three channels
+syn4$mu.check                # recomposed in quadrature
+syn4$mu.total                # == mu.check, exactly
+```
+
+Note these variants need **no `B.y`**. Subsample-and-aggregate takes its
+sensitivity from the coefficient box, so a bound on the response buys nothing
+here.
+
+### When the response does admit a public clip: Route 3
+
+`gen.syn.dp.full()` above releases the covariates themselves. Route 3 takes the
+other option on the same problem, keeping the design private and releasing the
+whitened sufficient statistics instead. It needs a public whitening matrix `W`,
+a public bound `B.x` on `||W x||` over the support box, and a public clip on the
+response. Ask for it by name:
+
+```{r}
+d5 <- data.frame(x1 = rnorm(400), x2 = rnorm(400))
+d5$y <- 1 + 0.5 * d5$x1 - 0.3 * d5$x2 + rnorm(400)
+
+W <- diag(3)
+dimnames(W) <- list(c("(Intercept)", "x1", "x2"),
+                    c("(Intercept)", "x1", "x2"))
+
+syn5 <- dp.project(d5, y ~ x1 + x2, epsilon = 10, route = "suffstat",
+                   W = W, B.x = sqrt(1 + 2 * 6^2),   # six sd on each standard normal
+                   y.centre = 0, y.scale = 1, y.clip = c(-8, 8),
+                   seed = 7)
+
+syn5$variant                 # V6
+syn5$mu.channels             # vech, X'y, y'y, and the eigenvalue channel
+syn5$beta.infer              # the recentred inference pair
+```
+
+Every one of `W`, `B.x`, and `y.clip` must be public, on the same footing as
+`B.y` in Route 1. They are forwarded rather than defaulted, so omitting one
+reaches Route 3's own refusal naming what is missing. For the tuning knobs
+beyond these constants (`mu.split`, `lambda`, `eig.split`), call
+`gen.syn.dp.suffstats()` directly.
+
+`mu.split` moves budget between the channels. The default starves the covariate
+channels in favour of the coefficient, because the analyst's refit recovers
+`beta_DP` to double-precision machine epsilon and so the joint law of the synthetic `X` does
+not touch inferential fidelity:
+
+```{r}
+# default: inferential fidelity
+c(marg = 0.05, corr = 0.05, coef = 0.90)
+
+# shift it when the release must also describe X well
+descriptive <- gen.syn.dp.full(d4, y ~ age + income, x.spec = x.spec,
+                               epsilon = 10, delta = 1e-6,
+                               mu.split = c(marg = 0.25, corr = 0.25, coef = 0.50),
+                               clip.lo = -1, clip.hi = 1,
+                               disp.lo = 0, disp.hi = 4, seed = 1)
+descriptive$mu.channels
+```
+
+The split moves budget, not cost: `mu.total` is identical either way.
+
+## 6. Why mu, and not epsilon
+
+Every channel is calibrated in **mu-Gaussian DP** (Dong, Roth and Su 2022) and
+the `(epsilon, delta)` label is read off the exact dual at the very end. Two
+reasons.
+
+**Composition.** Gaussian DP composes in quadrature. The classical
+`(epsilon, delta)` pair does not: two mechanisms give `(2 eps, 2 delta)` by basic
+composition, a bound that degrades linearly and that no choice of mechanism
+recovers from. Under mu, `delta` no longer accumulates across channels at all.
+
+**The classical multiplier is only valid below `eps = 1`.** The Dwork-Roth
+Theorem A.1 bound `sqrt(2 log(1.25/delta))/eps` silently *under-noises* above
+that. At `eps = 10, delta = 1e-6` it certifies only `delta = 1.9e-6`, nearly
+twice what was asked for:
+
+```{r}
+eps <- 10; delta <- 1e-6
+mu.classical <- 1 / (sqrt(2 * log(1.25 / delta)) / eps)
+synthexpln:::.gdp.delta(eps, mu.classical)     # what it ACTUALLY certifies
+
+mu.exact <- synthexpln:::.gdp.mu.from.eps.delta(eps, delta)
+synthexpln:::.gdp.delta(eps, mu.exact)         # what was asked for
+```
+
+## 7. What is NOT differentially private
+
+`gen.syn.dp.projected()` (V1) calibrates its noise to the DFBETA **local**
+sensitivity, measured on the realised data. It carries **no formal DP guarantee**
+at the stated epsilon or at any other, it warns on every call, and `dp.project()`
+does not dispatch to it. It is retained as an *empirical-DP baseline*, which is a
+real and useful quantity to compare against, and nothing more.
+
+`sensitivity.local()` likewise computes a real quantity. It measures how much one
+row of *this* dataset moves the fit, which is a sound influence diagnostic and the
+natural yardstick for an empirical-versus-worst-case comparison. **Do not calibrate
+a release to it.**
+
+The same applies to `sens.method = "local"` on `gen.syn.dp.full()` and
+`gen.syn.dp.logistic()`, kept only so that pre-0.2.0 runs can be reproduced. It
+warns on every call.
+
+## 8. Auditing the claim
+
+`dp.audit()` runs a canary distinguishing game on a neighbouring pair. For a
+mu-GDP mechanism the optimal distinguisher's AUC is at most
+$\Phi(\mu/\sqrt{2})$, which is a far smaller target than the accuracy bound
+usually quoted and can actually detect a leak.
+
+Watch for an attack advantage that is **flat in epsilon**. That is the
+fingerprint of a channel the noise did not reach, and it is how the
+virtual-response leak was caught: the old Route 2 release scored AUC 1.000 at
+*every* epsilon, because the real response was being carried into the release
+untouched and epsilon was disconnected from it.
+
+## 9. See also
+
+- `vignette("getting-started")` for the non-DP projection.
+- `vignette("calibrated-inference")` for correcting standard errors under DP.
+- Li (2026) "Conditional moment conditions to reproduce statistical inference
+  from synthetic data", the accompanying paper, `vignette("synthexpln-paper")`.

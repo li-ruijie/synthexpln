@@ -1,0 +1,7 @@
+bibentry(
+  bibtype = "Unpublished",
+  title   = "Conditional moment conditions to reproduce statistical inference from synthetic data",
+  author  = person("Ruijie", "Li"),
+  year    = "2026",
+  note    = "Manuscript, included as a vignette in the synthexpln R package"
+)

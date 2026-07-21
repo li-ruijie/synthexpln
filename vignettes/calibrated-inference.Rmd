@@ -1,0 +1,159 @@
+---
+title: "Calibrated inference under DP projection"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Calibrated inference under DP projection}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r include = FALSE}
+knitr::opts_chunk$set(collapse = TRUE, comment = "#>")
+```
+
+```{r setup}
+library(synthexpln)
+set.seed(1)
+```
+
+## 1. Why naive standard errors are too small
+
+When an analyst releases differentially private synthetic data, whoever refits the
+model on it recovers the published DP coefficients. The standard errors
+they compute from the synthetic data, however, are **too small**.
+
+The reason is that those standard errors capture only the sampling variability of
+the synthetic fit. They know nothing about the DP noise that produced
+$\beta_{DP} = \hat\beta + \eta_{DP}$ in the first place, because by the time the
+synthetic data exists that noise has already been folded into the point estimate
+and looks like signal.
+
+The two sources are independent, so they add in variance:
+
+$$SE_{\mathrm{corr},j} = \sqrt{SE_{\mathrm{syn},j}^2 + \sigma_{\beta,j}^2}$$
+
+where $\sigma_{\beta,j}$ is the standard deviation of the DP noise **on the raw
+scale of coefficient $j$**.
+
+> **There is no column scale in that formula.** A divisor $s_j$ belongs there only
+> when the mechanism perturbed the *standardised* coefficients, since noise of sd
+> $\sigma_\beta$ on $\beta_j s_j$ lands as sd $\sigma_\beta / s_j$ on $\beta_j$.
+> The sound routes do not do that: they add isotropic noise to the raw
+> $\hat\beta$ at a global sensitivity. Dividing anyway shrinks the DP variance
+> component by the column scale, which on a wide-scale covariate can be a factor
+> of several hundred, and the "corrected" interval is barely wider than
+> the uncorrected one. That understates the uncertainty of a private release,
+> which is the only direction this error must not take.
+
+Every DP generator therefore reports `$sigma.beta.raw`: a **named** vector of
+raw-scale noise sds, one per coefficient. Use it, and let the package refuse
+rather than guess if it cannot name them all.
+
+## 2. Computing corrected standard errors
+
+We use `gen.syn.dp.ols.public()`, the exact public-design route. `B.y` is a public
+bound on the response, taken from the DGP on the line above and not from the
+sample.
+
+```{r}
+n <- 500
+d <- data.frame(x = rnorm(n))
+d$y <- 1 + 0.7 * d$x + rnorm(n)
+
+syn <- gen.syn.dp.ols.public(d, y ~ x, epsilon = 10, delta = 1e-6,
+                             B.y = 8, seed = 1)
+
+fit.syn <- lm(y ~ x, syn$syn)
+se.syn  <- summary(fit.syn)$coefficients[, "Std. Error"]
+se.corr <- calibrated.se(se.syn, syn$sigma.beta.raw)
+
+data.frame(term    = names(se.syn),
+           se.syn  = round(se.syn, 4),
+           se.corr = round(se.corr, 4),
+           noise   = round(unname(syn$sigma.beta.raw), 4))
+```
+
+`fidelity.inferential()` does this for you, and will **error** rather than quietly
+return an uncorrected interval if the object cannot name its own noise scale:
+
+```{r}
+m <- fidelity.inferential(syn, orig = d, formula = y ~ x, calibrate = TRUE)
+round(rbind(naive = m$se.syn, corrected = m$se.corr), 4)
+```
+
+## 3. How standard error grows as the privacy budget decreases
+
+As epsilon falls the noise grows, and so does the corrected standard error. The
+naive one barely moves, which is the problem: it is blind to the
+mechanism.
+
+```{r}
+v.eps <- c(1, 2, 5, 10)
+out <- t(vapply(v.eps, function(eps) {
+  s   <- gen.syn.dp.ols.public(d, y ~ x, epsilon = eps, delta = 1e-6,
+                               B.y = 8, seed = 1)
+  fit <- lm(y ~ x, s$syn)
+  se  <- summary(fit)$coefficients["x", "Std. Error"]
+  c(eps     = eps,
+    se.syn  = se,
+    se.corr = calibrated.se(se, s$sigma.beta.raw[["x"]]))
+}, numeric(3)))
+round(out, 4)
+```
+
+## 4. Empirical coverage of confidence intervals
+
+The point of the correction is that the interval should cover the truth at its
+nominal rate. Generate data with a known coefficient, release it under DP, refit,
+and check.
+
+```{r}
+n <- 400
+beta.true <- 0.7
+n.reps <- 50   # small for vignette build time; scale up offline
+
+cover <- function(eps) {
+  res <- vapply(seq_len(n.reps), function(k) {
+    set.seed(100 + k)
+    dk <- data.frame(x = rnorm(n))
+    dk$y <- beta.true * dk$x + rnorm(n, sd = 0.5)
+    s   <- gen.syn.dp.ols.public(dk, y ~ x, epsilon = eps, delta = 1e-6,
+                                 B.y = 6, seed = k)
+    fit  <- lm(y ~ x, s$syn)
+    est  <- coef(fit)[["x"]]
+    se.s <- summary(fit)$coefficients["x", "Std. Error"]
+    se.c <- calibrated.se(se.s, s$sigma.beta.raw[["x"]])
+    c(naive = abs(est - beta.true) < 1.96 * se.s,
+      corr  = abs(est - beta.true) < 1.96 * se.c)
+  }, numeric(2))
+  rowMeans(res)
+}
+
+cover(10)
+```
+
+The corrected intervals reach approximately the nominal 95%. The naive ones undercover,
+because they omit the DP noise variance entirely.
+
+## 5. Scope and applicability
+
+- The correction is exact for the routes whose refit recovers `beta.dp` exactly:
+  `gen.syn.dp.ols.public()`, `gen.syn.dp.ridge.public()` and the Gaussian
+  `gen.syn.dp.projected.subagg()`.
+- **Route 3 bypasses this function entirely.**
+  `gen.syn.dp.suffstats()` returns its own inference pair, `$beta.infer` and
+  `$Cov.beta.infer`, the interval being centred at the unpenalised solve of the
+  released statistics rather than at the ridge point estimate. Add
+  `Cov.beta.infer[j, j]` to the synthetic variance directly, as that help page
+  sets out. Centring on `beta.dp` instead is what under-covered at the
+  strong-shrinkage budgets before the recentring fix.
+- It corrects the **coefficient** channel only. A noisy dispersion widens
+  `se.syn` on its own, and that is already in the naive term.
+- `gen.syn.dp.projected()` (V1) carries **no formal DP guarantee**, so calibrating
+  its intervals gives you calibrated uncertainty about a release with no privacy
+  claim. It is a baseline rather than a mechanism. See `vignette("dp-guide")`.
+
+## 6. See also
+
+- `vignette("dp-guide")` for choosing a DP route.
+- `vignette("getting-started")` for the non-DP projection.

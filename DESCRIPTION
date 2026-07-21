@@ -1,0 +1,43 @@
+Package: synthexpln
+Type: Package
+Title: Synthetic Data for Explanatory Models with Inferential Fidelity
+Version: 0.12.0
+Authors@R: person("Ruijie", "Li",
+    email = "ruijie@leefy.net",
+    role = c("aut", "cre"))
+Description: Generates synthetic data for generalised linear models
+    using the sufficient-statistics projection of Li (2026), whose
+    manuscript ships as a package vignette. The projection reproduces
+    the analyst's regression coefficients from p+1 constraints, at IEEE
+    754 double-precision machine epsilon under a Gaussian identity link,
+    more loosely for other families with accuracy improving in the sample
+    size, and to within integer rounding for Poisson. Differentially private
+    releases are provided by three routes: a global-sensitivity
+    Gaussian mechanism where the design is public and the response
+    admits a public bound, subsample-and-aggregate over a public
+    coefficient box where it does not, which needs no bound on the
+    response at all, and a whitened sufficient-statistic release that
+    keeps the design private where the response admits a public clip.
+    Every channel is calibrated in mu-Gaussian differential privacy
+    and composes in one quadrature. Calibrated standard errors and a
+    membership-inference audit are included.
+License: AGPL-3
+Encoding: UTF-8
+Depends: R (>= 4.1.0)
+Imports:
+    stats,
+    graphics,
+    MASS,
+    Matrix,
+    copula
+Suggests:
+    testthat (>= 3.0.0),
+    knitr,
+    rmarkdown,
+    ggplot2,
+    dplyr,
+    statmod,
+    R.rsp
+VignetteBuilder: knitr, R.rsp
+Config/testthat/edition: 3
+Config/roxygen2/version: 8.1.0
